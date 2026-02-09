@@ -146,4 +146,23 @@ Stats are emitted periodically (every few seconds) and counters are reset after 
 
 ## License and Contributions
 
-This project is distributed under the license specified in `LICENSE` (see repository).  
+Here’s an MIT license file plus an explicit experimental‑use warning you can drop into `LICENSE` or `LICENSE.txt`. Replace the placeholders as needed.
+
+***
+
+MIT License
+
+Copyright (c) 2025 Max Gecse
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+EXPERIMENTAL USE WARNING
+
+This software is an experimental automotive intrusion detection system (IDS) and is not designed, tested, or warranted for use in production vehicles, safety‑critical systems, or any environment where its failure could result in injury, death, or significant property or environmental damage. The user is solely responsible for evaluating its suitability, validating its behavior, and integrating it in accordance with all applicable safety, security, and regulatory requirements. By using this software, you acknowledge that you do so at your own risk and that the authors and copyright holders bear no responsibility for any consequences arising from its use.
+
+
+
