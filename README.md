@@ -1,4 +1,4 @@
-Cheyenne CAN is a small experimental automotive intrusion detection system (IDS) for Linux SocketCAN that monitors a CAN bus, detects several anomaly types, and prints JSON alerts for SIEM/log pipelines.[1][2]
+Cheyenne CAN is a small experimental automotive intrusion detection system (IDS) for Linux SocketCAN that monitors a CAN bus, detects several anomaly types, and prints JSON alerts for SIEM/log pipelines.
 
 ## Overview
 
