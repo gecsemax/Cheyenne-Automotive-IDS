@@ -5,14 +5,14 @@ Cheyenne CAN is a small experimental automotive intrusion detection system (IDS)
 - **Name:** Cheyenne CAN Intrusion Detection System (IDS)  
 - Author: Max Gecse  
 - Language: C (single file: `cheyenne_can.c`)  
-- Platform: Linux with SocketCAN (e.g. `can0`, `vcan0`).[2][1]
+- Platform: Linux with SocketCAN (e.g. `can0`, `vcan0`).
 - Status: Experimental, not production‑ready; intended for research, demos, and lab use.  
 
 The IDS attaches to a CAN interface and inspects every received frame in real time, tracking basic statistics and raising JSON‑formatted alerts on suspicious activity.  
 
 ## Features
 
-- CAN bus monitoring via Linux SocketCAN raw sockets (PF_CAN, SOCK_RAW, CAN_RAW).[1][2]
+- CAN bus monitoring via Linux SocketCAN raw sockets (PF_CAN, SOCK_RAW, CAN_RAW).
 - Detection logic:
   - ID flooding / local DoS, per CAN ID with configurable frame‑rate threshold per time window.  
   - Global bus flooding / DoS, based on overall frame rate in a sliding time window.  
@@ -27,11 +27,11 @@ The IDS attaches to a CAN interface and inspects every received frame in real ti
 
 ### Prerequisites
 
-- Linux system with SocketCAN support enabled in the kernel.[2][1]
+- Linux system with SocketCAN support enabled in the kernel.
 - Development packages providing:
   - `<linux/can.h>`, `<linux/can/raw.h>`  
   - POSIX threads (pthreads)  
-- A configured CAN or virtual CAN interface (e.g. `can0`, `vcan0`).[4][1][2]
+- A configured CAN or virtual CAN interface (e.g. `can0`, `vcan0`).
 
 ### Compilation
 
@@ -86,7 +86,7 @@ If `--allow-id` is not supplied, all IDs are treated as allowed and no `id_spoof
 
 ## JSON Output
 
-Alerts and stats are printed as one JSON object per line to stdout, making it easy to consume with tools like `jq`, Logstash, or custom collectors.[5][3]
+Alerts and stats are printed as one JSON object per line to stdout, making it easy to consume with tools like `jq`, Logstash, or custom collectors.
 
 Typical alert:
 
