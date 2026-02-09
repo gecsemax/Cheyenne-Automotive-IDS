@@ -1,0 +1,710 @@
+// Cheyenne CAN Intrusion Detection System
+// Author: Max Gecse
+// File: cheyenne_can.c
+//
+// Experimental IDS for CAN bus using SocketCAN.
+// Detects:
+//  - ID flooding / DoS (per-ID and global rates)
+//  - Unknown / disallowed IDs
+//  - Simple replay (repeated frames for same ID/data pattern)
+//  - Value range and DLC anomalies for selected IDs
+//
+// JSON alerts are printed to stdout for easy integration with SIEM/log pipelines.
+//
+// WARNING: Experimental, not production-ready. See README and LICENSE.
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+#include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+#include <pthread.h>
+#include <sys/time.h>
+
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <linux/can.h>
+#include <linux/can/raw.h>
+
+#define MAX_ID_STATS        2048
+#define MAX_ALLOWED_IDS     512
+#define MAX_VALUE_RULES     256
+
+#define IDS_WINDOW_SECONDS  1
+#define FLOOD_THRESHOLD_ID  1000    // frames per ID per window
+#define FLOOD_THRESHOLD_ALL 5000    // total frames per window
+
+#define REPLAY_WINDOW_FRAMES 32
+#define MAX_IFACE_NAME      32
+
+#define ALERT_WINDOW_SECONDS 1
+#define ALERT_MAX_PER_KEY   10
+
+static volatile int g_stop = 0;
+
+// --------- performance stats ----------
+
+typedef struct {
+    unsigned long long frames_total;
+    unsigned long long frames_alerted;
+    unsigned long long frames_dropped; // reserved, we don't drop on CAN
+    double frame_avg_usec;
+    time_t last_stats_ts;
+} perf_stats_t;
+
+static perf_stats_t g_stats;
+static pthread_mutex_t g_stats_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+// configurable thresholds
+static int g_id_threshold   = FLOOD_THRESHOLD_ID;
+static int g_bus_threshold  = FLOOD_THRESHOLD_ALL;
+static int g_window_seconds = IDS_WINDOW_SECONDS;
+
+// --------- per-ID statistics ----------
+
+typedef struct {
+    int used;
+    canid_t id;
+    unsigned long count_in_window;
+    time_t window_start;
+
+    struct can_frame recent[REPLAY_WINDOW_FRAMES];
+    int recent_count;
+} can_id_stats_t;
+
+static can_id_stats_t g_id_stats[MAX_ID_STATS];
+static pthread_mutex_t g_id_stats_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+// --------- allowed ID list ----------
+
+static canid_t g_allowed_ids[MAX_ALLOWED_IDS];
+static int g_allowed_id_count = 0;
+
+// --------- simple value-range rules ----------
+
+typedef struct {
+    int used;
+    canid_t id;
+    int byte_start; // inclusive
+    int byte_end;   // inclusive
+    uint8_t min_val;
+    uint8_t max_val;
+    int min_dlc;    // 0 = no constraint
+    int max_dlc;    // 0 = no constraint
+    char desc[64];
+} value_rule_t;
+
+static value_rule_t g_value_rules[MAX_VALUE_RULES];
+
+// --------- alert rate limiting ----------
+
+typedef struct {
+    int used;
+    canid_t id;
+    char type[16];          // "id_flood", "bus_flood", etc.
+    time_t window_start;
+    unsigned int count;
+    unsigned int suppressed;
+} alert_rate_t;
+
+#define MAX_ALERT_KEYS 256
+static alert_rate_t g_alert_rates[MAX_ALERT_KEYS];
+static pthread_mutex_t g_alert_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+// --------- utility ----------
+
+static void handle_signal(int sig) {
+    (void)sig;
+    g_stop = 1;
+}
+
+static void setup_signals(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_signal;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
+
+static void format_timestamp(char *buf, size_t sz) {
+    time_t now = time(NULL);
+    struct tm tm;
+    gmtime_r(&now, &tm);
+    strftime(buf, sz, "%Y-%m-%dT%H:%M:%SZ", &tm);
+}
+
+// --------- alert rate limiter ----------
+
+static int alert_rate_allow(canid_t id, const char *type, int *emit_summary) {
+    time_t now = time(NULL);
+    *emit_summary = 0;
+
+    pthread_mutex_lock(&g_alert_mtx);
+
+    int free_idx = -1;
+    alert_rate_t *slot = NULL;
+
+    for (int i = 0; i < MAX_ALERT_KEYS; i++) {
+        if (g_alert_rates[i].used &&
+            g_alert_rates[i].id == id &&
+            strncmp(g_alert_rates[i].type, type, sizeof(g_alert_rates[i].type)) == 0) {
+            slot = &g_alert_rates[i];
+            break;
+        }
+        if (!g_alert_rates[i].used && free_idx == -1)
+            free_idx = i;
+    }
+
+    if (!slot) {
+        if (free_idx == -1) {
+            pthread_mutex_unlock(&g_alert_mtx);
+            return 1; // table full, don't block alerts
+        }
+        slot = &g_alert_rates[free_idx];
+        memset(slot, 0, sizeof(*slot));
+        slot->used = 1;
+        slot->id = id;
+        strncpy(slot->type, type, sizeof(slot->type) - 1);
+        slot->window_start = now;
+        slot->count = 0;
+        slot->suppressed = 0;
+    }
+
+    if (slot->window_start == 0 || (now - slot->window_start) >= ALERT_WINDOW_SECONDS) {
+        if (slot->suppressed > 0) {
+            *emit_summary = 1;
+        }
+        slot->window_start = now;
+        slot->count = 0;
+        slot->suppressed = 0;
+    }
+
+    if (slot->count < ALERT_MAX_PER_KEY) {
+        slot->count++;
+        pthread_mutex_unlock(&g_alert_mtx);
+        return 1;
+    } else {
+        slot->suppressed++;
+        pthread_mutex_unlock(&g_alert_mtx);
+        return 0;
+    }
+}
+
+// --------- JSON logging ----------
+
+static void log_json_alert(const char *type,
+                           const struct can_frame *f,
+                           const char *iface,
+                           const char *reason) {
+    char ts[64];
+    format_timestamp(ts, sizeof(ts));
+
+    canid_t id = f->can_id & CAN_EFF_MASK;
+    int emit_summary = 0;
+    if (!alert_rate_allow(id, type, &emit_summary)) {
+        if (emit_summary) {
+            printf("{\"timestamp\":\"%s\","
+                   "\"event_type\":\"alert\","
+                   "\"alert_type\":\"%s_suppressed\","
+                   "\"iface\":\"%s\","
+                   "\"can_id\":%u,"
+                   "\"reason\":\"suppressed multiple '%s' alerts in last %d s\"}\n",
+                   ts, type, iface,
+                   id,
+                   type, ALERT_WINDOW_SECONDS);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    pthread_mutex_lock(&g_stats_mtx);
+    g_stats.frames_alerted++;
+    pthread_mutex_unlock(&g_stats_mtx);
+
+    printf("{\"timestamp\":\"%s\","
+           "\"event_type\":\"alert\","
+           "\"alert_type\":\"%s\","
+           "\"iface\":\"%s\","
+           "\"can_id\":%u,"
+           "\"dlc\":%u,"
+           "\"reason\":\"%s\","
+           "\"data\":\"",
+           ts, type, iface,
+           id,
+           (unsigned)f->can_dlc,
+           reason);
+
+    for (int i = 0; i < f->can_dlc; i++) {
+        printf("%02X", f->data[i]);
+    }
+    printf("\"}\n");
+    fflush(stdout);
+}
+
+static void log_json_stats(const char *iface) {
+    pthread_mutex_lock(&g_stats_mtx);
+    time_t now = time(NULL);
+    if (g_stats.last_stats_ts == 0) {
+        g_stats.last_stats_ts = now;
+        pthread_mutex_unlock(&g_stats_mtx);
+        return;
+    }
+    double interval = difftime(now, g_stats.last_stats_ts);
+    if (interval < 5.0) {
+        pthread_mutex_unlock(&g_stats_mtx);
+        return;
+    }
+
+    double fps = g_stats.frames_total / interval;
+
+    char ts[64];
+    format_timestamp(ts, sizeof(ts));
+
+    printf("{\"timestamp\":\"%s\","
+           "\"event_type\":\"stats\","
+           "\"iface\":\"%s\","
+           "\"frames_total\":%llu,"
+           "\"frames_alerted\":%llu,"
+           "\"frames_dropped\":%llu,"
+           "\"fps\":%.2f,"
+           "\"frame_avg_usec\":%.2f}\n",
+           ts,
+           iface,
+           (unsigned long long)g_stats.frames_total,
+           (unsigned long long)g_stats.frames_alerted,
+           (unsigned long long)g_stats.frames_dropped,
+           fps,
+           g_stats.frame_avg_usec);
+    fflush(stdout);
+
+    g_stats.last_stats_ts = now;
+    g_stats.frames_total = 0;
+    g_stats.frames_alerted = 0;
+    g_stats.frames_dropped = 0;
+    pthread_mutex_unlock(&g_stats_mtx);
+}
+
+// --------- allowed ID handling ----------
+
+static int is_id_allowed(canid_t id) {
+    if (g_allowed_id_count == 0)
+        return 1;
+    for (int i = 0; i < g_allowed_id_count; i++) {
+        if (g_allowed_ids[i] == id)
+            return 1;
+    }
+    return 0;
+}
+
+// --------- value rule handling ----------
+
+static void add_value_rule(canid_t id, int byte_start, int byte_end,
+                           uint8_t min_val, uint8_t max_val,
+                           const char *desc) {
+    for (int i = 0; i < MAX_VALUE_RULES; i++) {
+        if (!g_value_rules[i].used) {
+            g_value_rules[i].used = 1;
+            g_value_rules[i].id = id;
+            g_value_rules[i].byte_start = byte_start;
+            g_value_rules[i].byte_end = byte_end;
+            g_value_rules[i].min_val = min_val;
+            g_value_rules[i].max_val = max_val;
+            g_value_rules[i].min_dlc = 0;
+            g_value_rules[i].max_dlc = 0;
+            snprintf(g_value_rules[i].desc, sizeof(g_value_rules[i].desc),
+                     "%s", desc ? desc : "");
+            return;
+        }
+    }
+}
+
+static void check_value_rules(const struct can_frame *f,
+                              const char *iface) {
+    canid_t id = f->can_id & CAN_EFF_MASK;
+    for (int i = 0; i < MAX_VALUE_RULES; i++) {
+        if (!g_value_rules[i].used)
+            continue;
+        if (g_value_rules[i].id != id)
+            continue;
+
+        if (g_value_rules[i].min_dlc > 0 &&
+            f->can_dlc < g_value_rules[i].min_dlc) {
+            char reason[128];
+            snprintf(reason, sizeof(reason),
+                     "DLC anomaly on ID 0x%X dlc=%u (min_dlc=%d) %s",
+                     id, f->can_dlc,
+                     g_value_rules[i].min_dlc,
+                     g_value_rules[i].desc);
+            log_json_alert("dlc_anomaly", f, iface, reason);
+            continue;
+        }
+        if (g_value_rules[i].max_dlc > 0 &&
+            f->can_dlc > g_value_rules[i].max_dlc) {
+            char reason[128];
+            snprintf(reason, sizeof(reason),
+                     "DLC anomaly on ID 0x%X dlc=%u (max_dlc=%d) %s",
+                     id, f->can_dlc,
+                     g_value_rules[i].max_dlc,
+                     g_value_rules[i].desc);
+            log_json_alert("dlc_anomaly", f, iface, reason);
+            continue;
+        }
+
+        int start = g_value_rules[i].byte_start;
+        int end   = g_value_rules[i].byte_end;
+        if (start < 0) start = 0;
+        if (end >= f->can_dlc) end = f->can_dlc - 1;
+        if (start > end)
+            continue;
+
+        for (int b = start; b <= end; b++) {
+            uint8_t v = f->data[b];
+            if (v < g_value_rules[i].min_val ||
+                v > g_value_rules[i].max_val) {
+                char reason[128];
+                snprintf(reason, sizeof(reason),
+                         "value anomaly on ID 0x%X byte %d=%u (rule: %u-%u) %s",
+                         id, b, v,
+                         g_value_rules[i].min_val,
+                         g_value_rules[i].max_val,
+                         g_value_rules[i].desc);
+                log_json_alert("value_anomaly", f, iface, reason);
+                break;
+            }
+        }
+    }
+}
+
+// --------- per-ID stats & flood/replay detection ----------
+
+static can_id_stats_t *get_id_stats(canid_t id, time_t now) {
+    int free_idx = -1;
+    for (int i = 0; i < MAX_ID_STATS; i++) {
+        if (g_id_stats[i].used && g_id_stats[i].id == id)
+            return &g_id_stats[i];
+        if (!g_id_stats[i].used && free_idx == -1)
+            free_idx = i;
+    }
+    if (free_idx == -1)
+        free_idx = id % MAX_ID_STATS;
+
+    g_id_stats[free_idx].used = 1;
+    g_id_stats[free_idx].id = id;
+    g_id_stats[free_idx].count_in_window = 0;
+    g_id_stats[free_idx].window_start = now;
+    g_id_stats[free_idx].recent_count = 0;
+    return &g_id_stats[free_idx];
+}
+
+static int frames_equal(const struct can_frame *a, const struct can_frame *b) {
+    if (a->can_id != b->can_id || a->can_dlc != b->can_dlc)
+        return 0;
+    return memcmp(a->data, b->data, a->can_dlc) == 0;
+}
+
+static void check_id_flood_and_replay(const struct can_frame *f,
+                                      const char *iface,
+                                      time_t now) {
+    canid_t id = f->can_id & CAN_EFF_MASK;
+
+    pthread_mutex_lock(&g_id_stats_mtx);
+    can_id_stats_t *s = get_id_stats(id, now);
+    if (!s) {
+        pthread_mutex_unlock(&g_id_stats_mtx);
+        return;
+    }
+
+    if (s->window_start == 0 ||
+        (now - s->window_start) >= g_window_seconds) {
+        s->window_start = now;
+        s->count_in_window = 0;
+    }
+    s->count_in_window++;
+
+    if (g_id_threshold > 0 &&
+        s->count_in_window >= (unsigned long)g_id_threshold) {
+        char reason[128];
+        snprintf(reason, sizeof(reason),
+                 "high frame rate for ID 0x%X: >=%d frames in %d s",
+                 id, g_id_threshold, g_window_seconds);
+        log_json_alert("id_flood", f, iface, reason);
+    }
+
+    int replay_detected = 0;
+    for (int i = 0; i < s->recent_count; i++) {
+        if (frames_equal(f, &s->recent[i])) {
+            replay_detected = 1;
+            break;
+        }
+    }
+    if (replay_detected) {
+        char reason[128];
+        snprintf(reason, sizeof(reason),
+                 "possible replay on ID 0x%X (matching recent frame)", id);
+        log_json_alert("replay", f, iface, reason);
+    }
+
+    if (s->recent_count < REPLAY_WINDOW_FRAMES) {
+        s->recent[s->recent_count++] = *f;
+    } else {
+        for (int i = 1; i < REPLAY_WINDOW_FRAMES; i++) {
+            s->recent[i - 1] = s->recent[i];
+        }
+        s->recent[REPLAY_WINDOW_FRAMES - 1] = *f;
+    }
+
+    pthread_mutex_unlock(&g_id_stats_mtx);
+}
+
+// --------- global flood detection ----------
+
+static time_t g_global_window_start = 0;
+static unsigned long g_global_count_in_window = 0;
+
+static void check_global_flood(const struct can_frame *f,
+                               const char *iface,
+                               time_t now) {
+    if (g_global_window_start == 0 ||
+        (now - g_global_window_start) >= g_window_seconds) {
+        g_global_window_start = now;
+        g_global_count_in_window = 0;
+    }
+    g_global_count_in_window++;
+
+    if (g_bus_threshold > 0 &&
+        g_global_count_in_window >= (unsigned long)g_bus_threshold) {
+        char reason[128];
+        snprintf(reason, sizeof(reason),
+                 "high overall frame rate: >=%d frames in %d s",
+                 g_bus_threshold, g_window_seconds);
+        log_json_alert("bus_flood", f, iface, reason);
+    }
+}
+
+// --------- main process loop ----------
+
+typedef struct {
+    int sock;
+    char iface[MAX_IFACE_NAME];
+} can_thread_args_t;
+
+static void *can_capture_thread(void *arg) {
+    can_thread_args_t *args = (can_thread_args_t *)arg;
+    int sock = args->sock;
+    const char *iface = args->iface;
+
+    while (!g_stop) {
+        struct can_frame frame;
+        struct timeval t1, t2;
+        gettimeofday(&t1, NULL);
+
+        ssize_t n = recv(sock, &frame, sizeof(frame), 0);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("recv");
+            break;
+        }
+        if (n < (ssize_t)sizeof(struct can_frame))
+            continue;
+
+        time_t now = time(NULL);
+
+        pthread_mutex_lock(&g_stats_mtx);
+        g_stats.frames_total++;
+        pthread_mutex_unlock(&g_stats_mtx);
+
+        if (!is_id_allowed(frame.can_id & CAN_EFF_MASK)) {
+            char reason[128];
+            snprintf(reason, sizeof(reason),
+                     "frame from disallowed ID 0x%X",
+                     frame.can_id & CAN_EFF_MASK);
+            log_json_alert("id_spoof", &frame, iface, reason);
+        }
+
+        check_id_flood_and_replay(&frame, iface, now);
+        check_global_flood(&frame, iface, now);
+        check_value_rules(&frame, iface);
+
+        gettimeofday(&t2, NULL);
+        double usec = (t2.tv_sec - t1.tv_sec) * 1e6 +
+                      (t2.tv_usec - t1.tv_usec);
+
+        pthread_mutex_lock(&g_stats_mtx);
+        static unsigned long long count = 0;
+        count++;
+        if (count == 1) {
+            g_stats.frame_avg_usec = usec;
+        } else {
+            g_stats.frame_avg_usec =
+                (g_stats.frame_avg_usec * (count - 1) + usec) /
+                (double)count;
+        }
+        pthread_mutex_unlock(&g_stats_mtx);
+
+        log_json_stats(iface);
+    }
+
+    return NULL;
+}
+
+// --------- config helpers ----------
+
+static void print_usage(const char *prog) {
+    fprintf(stderr,
+            "Usage: %s -i <can_iface>\n"
+            "       [--allow-id HEX]...\n"
+            "       [--value-rule ID:byteStart-byteEnd:min-max:desc]\n"
+            "       [--id-threshold N] [--bus-threshold N] [--window N]\n"
+            "\n"
+            "Examples:\n"
+            "  %s -i can0\n"
+            "  %s -i vcan0 --allow-id 123 --allow-id 456\n"
+            "  %s -i can0 --value-rule 123:0-1:0-200:Speed\n"
+            "  %s -i can0 --id-threshold 500 --bus-threshold 2000 --window 2\n"
+            "\n", prog, prog, prog, prog, prog);
+}
+
+static int parse_can_id(const char *s, canid_t *out) {
+    char *end = NULL;
+    int base = 10;
+    if (strncmp(s, "0x", 2) == 0 || strncmp(s, "0X", 2) == 0)
+        base = 16;
+    unsigned long v = strtoul(s, &end, base);
+    if (end == s || v > 0x1FFFFFFFUL)
+        return -1;
+    *out = (canid_t)v;
+    return 0;
+}
+
+static int parse_value_rule_arg(const char *s) {
+    char buf[256];
+    strncpy(buf, s, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *id_str = strtok(buf, ":");
+    char *bytes_str = strtok(NULL, ":");
+    char *range_str = strtok(NULL, ":");
+    char *desc_str = strtok(NULL, "");
+
+    if (!id_str || !bytes_str || !range_str)
+        return -1;
+
+    canid_t id;
+    if (parse_can_id(id_str, &id) != 0)
+        return -1;
+
+    int byte_start, byte_end;
+    if (sscanf(bytes_str, "%d-%d", &byte_start, &byte_end) != 2)
+        return -1;
+    if (byte_start < 0) byte_start = 0;
+    if (byte_end > 7) byte_end = 7;
+    if (byte_start > byte_end) return -1;
+
+    unsigned int min_v, max_v;
+    if (sscanf(range_str, "%u-%u", &min_v, &max_v) != 2)
+        return -1;
+    if (min_v > 255 || max_v > 255)
+        return -1;
+
+    add_value_rule(id, byte_start, byte_end,
+                   (uint8_t)min_v, (uint8_t)max_v,
+                   desc_str ? desc_str : "");
+
+    return 0;
+}
+
+// --------- main ----------
+
+int main(int argc, char **argv) {
+    char iface[MAX_IFACE_NAME] = "can0";
+
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--iface") == 0) &&
+            i + 1 < argc) {
+            strncpy(iface, argv[++i], sizeof(iface) - 1);
+            iface[sizeof(iface) - 1] = '\0';
+        } else if (strcmp(argv[i], "--allow-id") == 0 && i + 1 < argc) {
+            if (g_allowed_id_count >= MAX_ALLOWED_IDS) {
+                fprintf(stderr, "Too many allowed IDs, ignoring %s\n", argv[i+1]);
+                i++;
+                continue;
+            }
+            canid_t id;
+            if (parse_can_id(argv[i+1], &id) == 0) {
+                g_allowed_ids[g_allowed_id_count++] = id;
+            } else {
+                fprintf(stderr, "Invalid CAN ID: %s\n", argv[i+1]);
+            }
+            i++;
+        } else if (strcmp(argv[i], "--value-rule") == 0 && i + 1 < argc) {
+            if (parse_value_rule_arg(argv[i+1]) != 0) {
+                fprintf(stderr, "Invalid value rule: %s\n", argv[i+1]);
+            }
+            i++;
+        } else if (strcmp(argv[i], "--id-threshold") == 0 && i + 1 < argc) {
+            g_id_threshold = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--bus-threshold") == 0 && i + 1 < argc) {
+            g_bus_threshold = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--window") == 0 && i + 1 < argc) {
+            g_window_seconds = atoi(argv[++i]);
+            if (g_window_seconds <= 0)
+                g_window_seconds = IDS_WINDOW_SECONDS;
+        } else {
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    printf("# Cheyenne CAN IDS starting on interface %s\n", iface);
+    fflush(stdout);
+
+    setup_signals();
+
+    int sock = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (sock < 0) {
+        perror("socket(PF_CAN)");
+        return 1;
+    }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name) - 1);
+    if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
+        perror("SIOCGIFINDEX");
+        close(sock);
+        return 1;
+    }
+
+    struct sockaddr_can addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.can_family = AF_CAN;
+    addr.can_ifindex = ifr.ifr_ifindex;
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(sock);
+        return 1;
+    }
+
+    can_thread_args_t args;
+    args.sock = sock;
+    strncpy(args.iface, iface, sizeof(args.iface) - 1);
+    args.iface[sizeof(args.iface) - 1] = '\0';
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, can_capture_thread, &args) != 0) {
+        perror("pthread_create");
+        close(sock);
+        return 1;
+    }
+
+    pthread_join(tid, NULL);
+    close(sock);
+    return 0;
+}
