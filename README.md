@@ -142,14 +142,8 @@ Stats are emitted periodically (every few seconds) and counters are reset after 
 - Experimental proof‑of‑concept; not audited or hardened for production use.  
 - Single‑threaded capture loop with global locks; heavy traffic on high‑speed CAN or CAN‑FD may stress performance.[2]
 - No persistence of learned baselines, no cryptographic authentication, and no physical‑layer checks.  
-- Assumes a trusted host and kernel; a compromised Linux system can still manipulate traffic before it reaches the IDS.  
-
-## License and Contributions
-
-Here’s an MIT license file plus an explicit experimental‑use warning you can drop into `LICENSE` or `LICENSE.txt`. Replace the placeholders as needed.
-
-***
-
+- Assumes a trusted host and kernel; a compromised Linux system can still manipulate traffic before it reaches the IDS.
+- 
 MIT License
 
 Copyright (c) 2025 Max Gecse
